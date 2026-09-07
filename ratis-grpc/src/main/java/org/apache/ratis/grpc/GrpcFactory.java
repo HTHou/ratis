@@ -93,7 +93,7 @@ public class GrpcFactory implements ServerFactory, ClientFactory {
 
   private final GrpcServices.Customizer servicesCustomizer;
   private final ServerCredentials serverCredentials;
-  private final Consumer<GrpcDataTransferEvent> dataTransferEventConsumer;
+  private final GrpcLogAppenderListener.Factory logAppenderListenerFactory;
 
   private final Supplier<SslContexts> forServerSupplier;
   private final Supplier<SslContexts> forClientSupplier;
@@ -101,7 +101,7 @@ public class GrpcFactory implements ServerFactory, ClientFactory {
   public GrpcFactory(Parameters parameters) {
     this(GrpcConfigKeys.Server.servicesCustomizer(parameters),
         GrpcConfigKeys.Server.credentials(parameters),
-        GrpcConfigKeys.Server.dataTransferEventConsumer(parameters),
+        GrpcConfigKeys.Server.logAppenderListenerFactory(parameters),
         GrpcConfigKeys.TLS.conf(parameters),
         GrpcConfigKeys.Admin.tlsConf(parameters),
         GrpcConfigKeys.Client.tlsConf(parameters),
@@ -111,12 +111,12 @@ public class GrpcFactory implements ServerFactory, ClientFactory {
 
   private GrpcFactory(GrpcServices.Customizer servicesCustomizer,
       ServerCredentials serverCredentials,
-      Consumer<GrpcDataTransferEvent> dataTransferEventConsumer,
+      GrpcLogAppenderListener.Factory logAppenderListenerFactory,
       GrpcTlsConfig tlsConfig, GrpcTlsConfig adminTlsConfig,
       GrpcTlsConfig clientTlsConfig, GrpcTlsConfig serverTlsConfig) {
     this.servicesCustomizer = servicesCustomizer;
     this.serverCredentials = serverCredentials;
-    this.dataTransferEventConsumer = dataTransferEventConsumer;
+    this.logAppenderListenerFactory = logAppenderListenerFactory;
 
     this.forServerSupplier = MemoizedSupplier.valueOf(() -> new SslContexts(
         tlsConfig, adminTlsConfig, clientTlsConfig, serverTlsConfig, BUILD_SSL_CONTEXT_FOR_SERVER));
@@ -131,11 +131,15 @@ public class GrpcFactory implements ServerFactory, ClientFactory {
 
   @Override
   public LogAppender newLogAppender(RaftServer.Division server, LeaderState state, FollowerInfo f) {
-    final GrpcDataTransferEvent.ProtectionMethod protectionMethod =
-        dataTransferEventConsumer != null && forClientSupplier.get().serverSslContext != null
-            ? GrpcDataTransferEvent.ProtectionMethod.TLS
-            : GrpcDataTransferEvent.ProtectionMethod.NONE;
-    return new GrpcLogAppender(server, state, f, dataTransferEventConsumer, protectionMethod);
+    GrpcLogAppenderListener listener = null;
+    if (logAppenderListenerFactory != null) {
+      try {
+        listener = logAppenderListenerFactory.create(server.getMemberId(), f.getPeer());
+      } catch (Throwable t) {
+        LOG.warn("Failed to create gRPC log appender listener", t);
+      }
+    }
+    return new GrpcLogAppender(server, state, f, listener);
   }
 
   @Override
