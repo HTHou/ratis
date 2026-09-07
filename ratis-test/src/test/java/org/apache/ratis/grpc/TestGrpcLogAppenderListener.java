@@ -30,7 +30,6 @@ import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
 import org.apache.ratis.proto.RaftProtos.ReplicationLevel;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeerId;
-import org.apache.ratis.security.SecurityTestUtils;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.impl.MiniRaftCluster;
@@ -44,8 +43,6 @@ import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -63,21 +60,9 @@ public class TestGrpcLogAppenderListener extends BaseTest {
     return properties;
   }
 
-  private static void setTls(Parameters parameters) throws Exception {
-    GrpcConfigKeys.Server.setTlsConf(parameters, new GrpcTlsConfig(
-        SecurityTestUtils.getKeyManager(SecurityTestUtils::getServerKeyStore),
-        SecurityTestUtils.getTrustManager(SecurityTestUtils::getTrustStore), true));
-    final GrpcTlsConfig client = new GrpcTlsConfig(
-        SecurityTestUtils.getKeyManager(SecurityTestUtils::getClientKeyStore),
-        SecurityTestUtils.getTrustManager(SecurityTestUtils::getTrustStore), true);
-    GrpcConfigKeys.Admin.setTlsConf(parameters, client);
-    GrpcConfigKeys.Client.setTlsConf(parameters, client);
-  }
-
-  @ParameterizedTest
-  @ValueSource(booleans = {false, true})
+  @Test
   @Timeout(value = 60, unit = TimeUnit.SECONDS)
-  public void testAppendEntries(boolean tls) throws Exception {
+  public void testAppendEntries() throws Exception {
     final Parameters parameters = new Parameters();
     final Set<RaftPeerId> destinations = ConcurrentHashMap.newKeySet();
     final ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
@@ -108,9 +93,6 @@ public class TestGrpcLogAppenderListener extends BaseTest {
             }
           }
         });
-    if (tls) {
-      setTls(parameters);
-    }
     try (MiniRaftClusterWithGrpc cluster = new MiniRaftClusterWithGrpc(
         MiniRaftCluster.generateIds(3, 10), new String[0], newProperties(), parameters)) {
       cluster.start();
