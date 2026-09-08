@@ -34,12 +34,10 @@ import org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftPeerId;
-import org.apache.ratis.protocol.exceptions.TimeoutIOException;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.leader.FollowerInfo;
 import org.apache.ratis.server.leader.LeaderState;
 import org.apache.ratis.server.leader.LogAppender;
-import org.apache.ratis.statemachine.SnapshotInfo;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -49,17 +47,15 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
 import java.io.IOException;
-import java.util.concurrent.CompletableFuture;
+import java.io.InterruptedIOException;
 import java.util.concurrent.TimeUnit;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
@@ -68,6 +64,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -77,6 +74,7 @@ public class TestGrpcLogAppenderCallbacks {
   private final RaftPeerId source = RaftPeerId.valueOf("source");
   private final RaftPeerId destination = RaftPeerId.valueOf("destination");
   private final GrpcLogAppenderListener listener = mock(GrpcLogAppenderListener.class);
+  private final GrpcLogAppenderListener.AppendEntries appendEntries = mock(GrpcLogAppenderListener.AppendEntries.class);
   private final RaftServer.Division server = mock(RaftServer.Division.class, RETURNS_DEEP_STUBS);
   private final FollowerInfo follower = mock(FollowerInfo.class, RETURNS_DEEP_STUBS);
   private final LeaderState leaderState = mock(LeaderState.class);
@@ -99,6 +97,7 @@ public class TestGrpcLogAppenderCallbacks {
     when(follower.getId()).thenReturn(destination);
     when(follower.getName()).thenReturn("test-follower");
     when(serverRpc.getProxies().getProxy(destination)).thenReturn(client);
+    when(listener.appendEntries()).thenReturn(appendEntries);
     appender = spy(new GrpcLogAppender(server, leaderState, follower, listener));
     pending = (GrpcLogAppender.RequestMap) RaftTestUtil.getDeclaredField(appender, "pendingRequests");
     metrics = (GrpcServerMetrics) RaftTestUtil.getDeclaredField(appender, "grpcServerMetrics");
@@ -140,9 +139,9 @@ public class TestGrpcLogAppenderCallbacks {
     }
     clearInvocations(client, leaderState, follower, follower.getErrorState());
     final IOException error = new IOException("Stream failed after leadership ended");
-    doThrow(new IllegalStateException("Listener failure")).when(listener).onAppendEntriesReset(error);
+    doThrow(new IllegalStateException("Listener failure")).when(appendEntries).onError(error);
     Assertions.assertDoesNotThrow(() -> responses.onError(error));
-    verify(listener).onAppendEntriesReset(error);
+    verify(appendEntries).onError(error);
     verifyNoInteractions(client, leaderState, follower.getErrorState());
     verify(follower, never()).computeNextIndex(any());
   }
@@ -152,8 +151,11 @@ public class TestGrpcLogAppenderCallbacks {
     addPending(1);
     when(serverRpc.getProxies().getProxy(destination)).thenThrow(new IOException("Closed client"));
     final IOException error = new IOException("Original stream error");
+    doThrow(new IllegalStateException("Listener failure")).when(listener).onReset(anyString(), eq(error));
     responses.onError(error);
-    verify(listener).onAppendEntriesReset(error);
+    final InOrder order = inOrder(appendEntries, listener);
+    order.verify(appendEntries).onError(error);
+    order.verify(listener).onReset(anyString(), eq(error));
   }
 
   @Test
@@ -162,7 +164,8 @@ public class TestGrpcLogAppenderCallbacks {
     appender.stopAsync().get(5, TimeUnit.SECONDS);
     clearInvocations(client, leaderState);
     responses.onCompleted();
-    verify(listener).onAppendEntriesReset(isA(IOException.class));
+    verify(appendEntries).onCompleted();
+    verify(listener, never()).onReset(anyString(), any());
     verifyNoInteractions(client, leaderState);
   }
 
@@ -180,9 +183,9 @@ public class TestGrpcLogAppenderCallbacks {
       when(client.appendEntries(any(), eq(false))).thenThrow(error);
     }
     Assertions.assertSame(error, Assertions.assertThrows(Exception.class, () -> appender.appendLog(false)));
-    final InOrder order = inOrder(listener);
-    order.verify(listener).onAppendEntriesRequest(request);
-    order.verify(listener).onAppendEntriesFailure(1, error);
+    final InOrder order = inOrder(appendEntries);
+    order.verify(appendEntries).onRequest(request);
+    order.verify(appendEntries).onFailure(1, error);
     Assertions.assertFalse(appender.hasPendingDataRequests());
   }
 
@@ -191,58 +194,58 @@ public class TestGrpcLogAppenderCallbacks {
     addPending(1);
     appender.timeoutAppendRequest(1, false);
     appender.timeoutAppendRequest(1, false);
-    verify(listener).onAppendEntriesFailure(eq(1L), isA(TimeoutIOException.class));
+    verify(appendEntries).onTimeout(1);
   }
 
   @ParameterizedTest
   @EnumSource(value = AppendResult.class, names = {"SUCCESS", "NOT_LEADER", "INCONSISTENCY"})
-  public void testMatchedReply(AppendResult result) {
+  public void testReplyAndInvalidation(AppendResult result) {
     addPending(1);
+    addPending(2);
     final AppendEntriesReplyProto reply = AppendEntriesReplyProto.newBuilder()
         .setServerReply(RaftRpcReplyProto.newBuilder().setCallId(1)).setResult(result).build();
     responses.onNext(reply);
     responses.onNext(reply);
-    verify(listener).onAppendEntriesReply(reply);
+    verify(appendEntries, times(2)).onReply(reply);
+    if (result == AppendResult.INCONSISTENCY) {
+      verify(listener, times(2)).onReset(anyString(), eq(null));
+      Assertions.assertFalse(appender.hasPendingDataRequests());
+    }
     appender.timeoutAppendRequest(1, false);
-    verify(listener, never()).onAppendEntriesFailure(eq(1L), any());
+    verify(appendEntries, never()).onTimeout(1);
   }
 
-  @Test
-  public void testFactoryFailureIsIsolated() throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testListenerInitializationFailureIsIsolated(boolean failFactory) throws Exception {
+    when(listener.appendEntries()).thenThrow(new IllegalStateException("Injected accessor failure"));
     final Parameters parameters = new Parameters();
     GrpcConfigKeys.Server.setLogAppenderListenerFactory(parameters, (member, peer) -> {
       Assertions.assertEquals(server.getMemberId(), member);
       Assertions.assertEquals(follower.getPeer(), peer);
-      throw new IllegalStateException("Injected factory failure");
+      if (failFactory) {
+        throw new IllegalStateException("Injected factory failure");
+      }
+      return listener;
     });
     final LogAppender created = new GrpcFactory(parameters).newLogAppender(server, leaderState, follower);
     Assertions.assertNotNull(created);
     created.stopAsync().get(5, TimeUnit.SECONDS);
   }
 
-  @Test
-  public void testSnapshotStreamCreationFailure() throws Exception {
-    final IOException error = new IOException("Cannot create snapshot connection");
-    when(serverRpc.getProxies().getProxy(destination)).thenThrow(error);
-    appender.installSnapshot(mock(SnapshotInfo.class, RETURNS_DEEP_STUBS));
-    final ArgumentCaptor<String> requestId = ArgumentCaptor.forClass(String.class);
-    final InOrder order = inOrder(listener);
-    order.verify(listener).onInstallSnapshotStart(requestId.capture(), eq(false));
-    order.verify(listener).onInstallSnapshotEnd(requestId.getValue(), error);
-    verify(listener, never()).onInstallSnapshotRequest(anyString(), any());
-  }
-
-  @Test
-  public void testSnapshotErrorAfterStopUnblocksWaiter() throws Exception {
-    final GrpcLogAppender.InstallSnapshotResponseHandler snapshot = appender.new InstallSnapshotResponseHandler();
-    final ArgumentCaptor<String> requestId = ArgumentCaptor.forClass(String.class);
-    verify(listener).onInstallSnapshotStart(requestId.capture(), eq(false));
-    final CompletableFuture<?> done = (CompletableFuture<?>) RaftTestUtil.getDeclaredField(snapshot, "done");
-    appender.stopAsync().get(5, TimeUnit.SECONDS);
-    final IOException error = new IOException("Snapshot stream failed after stop");
-    doThrow(new IllegalStateException("Listener failure")).when(listener).onInstallSnapshotEnd(anyString(), any());
-    snapshot.onError(error);
-    Assertions.assertTrue(done.isDone());
-    verify(listener).onInstallSnapshotEnd(requestId.getValue(), error);
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testRunLoopExit(boolean exceptional) throws Exception {
+    addPending(1);
+    doThrow(new IllegalStateException("Listener failure")).when(listener).onNotRunning();
+    if (exceptional) {
+      final InterruptedIOException error = new InterruptedIOException("Interrupted send");
+      doThrow(error).when(appender).appendLog(true);
+      Assertions.assertSame(error, Assertions.assertThrows(IOException.class, appender::run));
+    } else {
+      when(server.getInfo().isLeader()).thenReturn(false);
+      appender.run();
+    }
+    verify(listener).onNotRunning();
   }
 }

@@ -136,7 +136,7 @@ public class GrpcFactory implements ServerFactory, ClientFactory {
       try {
         listener = logAppenderListenerFactory.create(server.getMemberId(), f.getPeer());
       } catch (Throwable t) {
-        LOG.warn("Failed to create gRPC log appender listener", t);
+        LOG.warn("{}->{}: Failed to create gRPC log appender listener", server.getMemberId(), f.getId(), t);
       }
     }
     return new GrpcLogAppender(server, state, f, listener);

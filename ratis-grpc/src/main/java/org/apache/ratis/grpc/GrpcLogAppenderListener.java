@@ -19,8 +19,6 @@ package org.apache.ratis.grpc;
 
 import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto;
 import org.apache.ratis.proto.RaftProtos.AppendEntriesRequestProto;
-import org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto;
-import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
 import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftPeer;
 
@@ -29,8 +27,8 @@ import org.apache.ratis.protocol.RaftPeer;
  * hold an appender lock. They must not block or retain request payloads. Exceptions are isolated
  * from replication. Callbacks describe lifecycle activity, not application-level outcomes:
  * consumers are responsible for correlating requests, handling racing terminal notifications,
- * filtering messages and aggregating snapshot chunks.
- * Append request, matched-reply and reset callbacks are serialized per appender. Failure
+ * and filtering messages. This interface currently observes AppendEntries, not InstallSnapshot.
+ * Append request, reply and reset callbacks are serialized per appender. Failure
  * callbacks may race with these callbacks. No exactly-once terminal notification is guaranteed.
  */
 public interface GrpcLogAppenderListener {
@@ -41,30 +39,38 @@ public interface GrpcLogAppenderListener {
     GrpcLogAppenderListener create(RaftGroupMemberId source, RaftPeer destination);
   }
 
-  /** An append attempt is registered, before establishing or writing its stream. */
-  default void onAppendEntriesRequest(AppendEntriesRequestProto request) { }
+  /** @return the AppendEntries listener, or null to disable its callbacks. Called once per appender. */
+  default AppendEntries appendEntries() {
+    return null;
+  }
 
-  /** A response was matched to a pending append request. */
-  default void onAppendEntriesReply(AppendEntriesReplyProto reply) { }
+  /** Observes append attempts and their response streams, including the separate heartbeat stream. */
+  interface AppendEntries {
+    /** An append attempt is registered, before establishing or writing its stream. */
+    default void onRequest(AppendEntriesRequestProto request) { }
 
-  /** A local send error or request timeout occurred; a later stream notification may follow. */
-  default void onAppendEntriesFailure(long callId, Throwable error) { }
+    /** A response was received, possibly after its request timed out or was invalidated. */
+    default void onReply(AppendEntriesReplyProto reply) { }
 
-  /** Pending append attempts are invalidated by a reset or by a stopped response stream. */
-  default void onAppendEntriesReset(Throwable error) { }
+    /** A local send error occurred; a later stream notification may follow. */
+    default void onFailure(long callId, Throwable error) { }
 
-  /** A snapshot attempt starts before stream creation, including notification-only attempts. */
-  default void onInstallSnapshotStart(String requestId, boolean notificationOnly) { }
+    /** A pending request timed out. */
+    default void onTimeout(long callId) { }
 
-  /** A snapshot chunk or notification is about to be sent. */
-  default void onInstallSnapshotRequest(String requestId, InstallSnapshotRequestProto request) { }
+    /** A response stream completed, including after the appender stopped. */
+    default void onCompleted() { }
 
-  /** A snapshot response was received; this is not necessarily a terminal response. */
-  default void onInstallSnapshotReply(String requestId, InstallSnapshotReplyProto reply) { }
+    /** A response stream failed, including after the appender stopped. */
+    default void onError(Throwable error) { }
+  }
 
   /**
-   * The stream completed (null error), failed, or its sender was interrupted. Completion alone
-   * does not imply that all chunks were sent or acknowledged. Racing notifications may repeat.
+   * Pending attempts are invalidated before resetting the client or reconciling an inconsistent log.
+   * The reason is diagnostic text, not a stable identifier; error may be null.
    */
-  default void onInstallSnapshotEnd(String requestId, Throwable error) { }
+  default void onReset(String reason, Throwable error) { }
+
+  /** The appender run loop exited, normally or exceptionally. Pending attempts may remain. */
+  default void onNotRunning() { }
 }
