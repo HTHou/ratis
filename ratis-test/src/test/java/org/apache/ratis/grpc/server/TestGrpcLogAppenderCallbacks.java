@@ -39,6 +39,8 @@ import org.apache.ratis.server.leader.FollowerInfo;
 import org.apache.ratis.server.leader.LeaderState;
 import org.apache.ratis.server.leader.LogAppender;
 import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
+import org.apache.ratis.util.AutoCloseableLock;
+import org.apache.ratis.util.AutoCloseableReadWriteLock;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -51,6 +53,9 @@ import org.mockito.InOrder;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -151,11 +156,11 @@ public class TestGrpcLogAppenderCallbacks {
     addPending(1);
     when(serverRpc.getProxies().getProxy(destination)).thenThrow(new IOException("Closed client"));
     final IOException error = new IOException("Original stream error");
-    doThrow(new IllegalStateException("Listener failure")).when(listener).onReset(anyString(), eq(error));
+    doThrow(new IllegalStateException("Listener failure")).when(listener).onResetClient(anyString(), eq(error));
     responses.onError(error);
     final InOrder order = inOrder(appendEntries, listener);
     order.verify(appendEntries).onError(error);
-    order.verify(listener).onReset(anyString(), eq(error));
+    order.verify(listener).onResetClient(anyString(), eq(error));
   }
 
   @Test
@@ -165,7 +170,7 @@ public class TestGrpcLogAppenderCallbacks {
     clearInvocations(client, leaderState);
     responses.onCompleted();
     verify(appendEntries).onCompleted();
-    verify(listener, never()).onReset(anyString(), any());
+    verify(listener, never()).onResetClient(anyString(), any());
     verifyNoInteractions(client, leaderState);
   }
 
@@ -208,11 +213,35 @@ public class TestGrpcLogAppenderCallbacks {
     responses.onNext(reply);
     verify(appendEntries, times(2)).onReply(reply);
     if (result == AppendResult.INCONSISTENCY) {
-      verify(listener, times(2)).onReset(anyString(), eq(null));
+      final InOrder order = inOrder(appendEntries);
+      order.verify(appendEntries).onReply(reply);
+      order.verify(appendEntries).onReplyInconsistency();
+      verify(appendEntries, times(2)).onReplyInconsistency();
       Assertions.assertFalse(appender.hasPendingDataRequests());
+    } else {
+      verify(appendEntries, never()).onReplyInconsistency();
     }
+    verify(listener, never()).onResetClient(anyString(), any());
     appender.timeoutAppendRequest(1, false);
     verify(appendEntries, never()).onTimeout(1);
+  }
+
+  @Test
+  public void testReplyDoesNotAcquireAppenderWriteLock() throws Exception {
+    addPending(1);
+    final AppendEntriesReplyProto reply = AppendEntriesReplyProto.newBuilder()
+        .setServerReply(RaftRpcReplyProto.newBuilder().setCallId(1)).setResult(AppendResult.SUCCESS).build();
+    final AutoCloseableReadWriteLock appenderLock =
+        (AutoCloseableReadWriteLock) RaftTestUtil.getDeclaredField(appender, "lock");
+    final ExecutorService executor = Executors.newSingleThreadExecutor();
+    try (AutoCloseableLock ignored = appenderLock.writeLock(null, null)) {
+      CompletableFuture.runAsync(() -> responses.onNext(reply), executor).get(5, TimeUnit.SECONDS);
+      verify(appendEntries).onReply(reply);
+      Assertions.assertFalse(appender.hasPendingDataRequests());
+    } finally {
+      executor.shutdownNow();
+      Assertions.assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
   }
 
   @ParameterizedTest

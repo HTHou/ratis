@@ -230,11 +230,6 @@ public class GrpcLogAppender extends LogAppenderBase {
     }
   }
 
-  /** Invoked with the appender write lock held. */
-  private void notifyReset(String reason, Throwable error) {
-    notifyListener(l -> l.onReset(reason, error));
-  }
-
   @Override
   public GrpcServicesImpl getServerRpc() {
     return (GrpcServicesImpl)super.getServerRpc();
@@ -246,7 +241,7 @@ public class GrpcLogAppender extends LogAppenderBase {
 
   private void resetClient(AppendEntriesRequest request, Event event, Throwable error) {
     try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
-      notifyReset("resetClient: " + event, error);
+      notifyListener(l -> l.onResetClient("resetClient: " + event, error));
       getClient().resetConnectBackoff();
       if (appendLogRequestObserver != null) {
         appendLogRequestObserver.stop();
@@ -546,11 +541,8 @@ public class GrpcLogAppender extends LogAppenderBase {
      */
     @Override
     public void onNext(AppendEntriesReplyProto reply) {
-      final AppendEntriesRequest request;
-      try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
-        request = pendingRequests.remove(reply);
-        notifyAppendEntriesListener(l -> l.onReply(reply));
-      }
+      final AppendEntriesRequest request = pendingRequests.remove(reply);
+      notifyAppendEntriesListener(l -> l.onReply(reply));
       if (request != null) {
         request.stopRequestTimer(); // Update completion time
         getFollower().updateLastRespondedAppendEntriesSendTime(request.getSendTime());
@@ -641,7 +633,7 @@ public class GrpcLogAppender extends LogAppenderBase {
 
   private void updateNextIndex(long replyNextIndex) {
     try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
-      notifyReset("AppendEntries INCONSISTENCY", null);
+      notifyAppendEntriesListener(GrpcLogAppenderListener.AppendEntries::onReplyInconsistency);
       pendingRequests.clear();
       getFollower().setNextIndex(replyNextIndex);
     }

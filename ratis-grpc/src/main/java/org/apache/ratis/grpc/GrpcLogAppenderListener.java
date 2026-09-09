@@ -28,8 +28,9 @@ import org.apache.ratis.protocol.RaftPeer;
  * from replication. Callbacks describe lifecycle activity, not application-level outcomes:
  * consumers are responsible for correlating requests, handling racing terminal notifications,
  * and filtering messages. This interface currently observes AppendEntries, not InstallSnapshot.
- * Append request, reply and reset callbacks are serialized per appender. Failure
- * callbacks may race with these callbacks. No exactly-once terminal notification is guaranteed.
+ * Append request registration, client reset and reply inconsistency callbacks are serialized per
+ * appender. Replies and other terminal callbacks may race with these callbacks. Consumers must
+ * handle these races; no exactly-once terminal notification is guaranteed.
  */
 public interface GrpcLogAppenderListener {
   /** Creates a separate listener for each appender, including after leadership changes. */
@@ -52,6 +53,12 @@ public interface GrpcLogAppenderListener {
     /** A response was received, possibly after its request timed out or was invalidated. */
     default void onReply(AppendEntriesReplyProto reply) { }
 
+    /**
+     * An INCONSISTENCY reply is being handled and pending append requests are about to be cleared.
+     * Called after onReply for that reply, with the appender write lock held, without resetting the client.
+     */
+    default void onReplyInconsistency() { }
+
     /** A local send error occurred; a later stream notification may follow. */
     default void onFailure(long callId, Throwable error) { }
 
@@ -66,10 +73,10 @@ public interface GrpcLogAppenderListener {
   }
 
   /**
-   * Pending attempts are invalidated before resetting the client or reconciling an inconsistent log.
+   * The client is about to be reset, which may invalidate pending append attempts.
    * The reason is diagnostic text, not a stable identifier; error may be null.
    */
-  default void onReset(String reason, Throwable error) { }
+  default void onResetClient(String reason, Throwable error) { }
 
   /** The appender run loop exited, normally or exceptionally. Pending attempts may remain. */
   default void onNotRunning() { }
